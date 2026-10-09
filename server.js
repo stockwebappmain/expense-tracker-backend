@@ -77,20 +77,16 @@ app.get('/auth/google/callback',
       { expiresIn: '7d' }
     );
 
-    // Send token as HttpOnly secure cookie
-    res.cookie('auth_token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
-    });
-
-    res.redirect(process.env.FRONTEND_URL || 'http://localhost:3000');
+    // Redirect with token in URL for localStorage storage
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(`${frontendUrl}?auth_token=${token}`);
   }
 );
 
 app.get('/api/auth/user', (req, res) => {
-  const token = req.cookies.auth_token;
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
 
   try {
@@ -98,6 +94,7 @@ app.get('/api/auth/user', (req, res) => {
     res.json({
       id: decoded.id,
       email: decoded.email,
+      name: decoded.name,
       accessToken: decoded.accessToken
     });
   } catch (error) {
