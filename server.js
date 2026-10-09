@@ -10,6 +10,7 @@ const session = require('express-session');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 
+// Load .env file only in development (not in production/Cloud Run)
 if (process.env.NODE_ENV !== 'production') {
   dotenv.config();
 }
