@@ -60,7 +60,9 @@ const sheetsClient = google.sheets('v4');
 
 // Authentication Routes
 app.get('/auth/google', passport.authenticate('google', {
-  scope: ['profile', 'email', 'https://www.googleapis.com/auth/spreadsheets']
+  scope: ['profile', 'email', 'https://www.googleapis.com/auth/spreadsheets'],
+  accessType: 'offline',
+  prompt: 'consent'
 }));
 
 app.get('/auth/google/callback',
@@ -70,8 +72,10 @@ app.get('/auth/google/callback',
     const token = jwt.sign(
       {
         id: req.user.id,
+        name: req.user.name,
         email: req.user.email,
-        accessToken: req.user.accessToken
+        accessToken: req.user.accessToken,
+        refreshToken: req.user.refreshToken
       },
       process.env.JWT_SECRET || 'your-jwt-secret-key',
       { expiresIn: '7d' }
@@ -109,8 +113,15 @@ app.get('/logout', (req, res) => {
 
 // Middleware to check authentication
 const authenticateUser = (req, res, next) => {
-  if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
-  next();
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET || 'your-jwt-secret-key');
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
 };
 
 // Google Sheets API Helper
