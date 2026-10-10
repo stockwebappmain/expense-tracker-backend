@@ -391,6 +391,37 @@ function normalizeSheetDate(raw) {
   return isNaN(d) ? str : `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
 
+const RECEIPT_TOOL = {
+  name: 'read_receipt',
+  description: 'Record exactly what is printed on a receipt photo.',
+  strict: true,
+  input_schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['merchant', 'date', 'payment', 'items', 'tax', 'total'],
+    properties: {
+      merchant: { type: 'string', description: 'Store name as printed.' },
+      date: { type: 'string', description: 'Receipt date as YYYY-MM-DD, or empty string if not printed.' },
+      payment: { type: 'string', description: 'Matching listed payment method name if the receipt shows the card (type or last 4 digits), otherwise the card text as printed, otherwise empty string.' },
+      items: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['name', 'amount', 'category'],
+          properties: {
+            name: { type: 'string' },
+            amount: { type: 'number', description: 'Final price printed for this line.' },
+            category: { type: 'string', description: 'Exactly one listed category name.' }
+          }
+        }
+      },
+      tax: { type: 'number', description: 'Total tax printed, or 0.' },
+      total: { type: 'number', description: 'Grand total printed (amount charged), or 0 if not visible.' }
+    }
+  }
+};
+
 function runExpenseQuery(rows, categoryRows, q) {
   const nonSpend = new Set(categoryRows
     .filter(r => NON_SPEND_TYPES.includes(String(r[4] || '').trim().toLowerCase()))
@@ -533,10 +564,10 @@ app.post('/api/scan', authenticateUser, async (req, res) => {
 
     const response = await anthropic.messages.create({
       model: ASSISTANT_MODEL,
-      max_tokens: 4000,
-      output_config: { effort: 'low' },
-      system: 'You read receipt photos for a personal expense tracker. Call propose_expenses with the receipt split into one entry per category that appears on it. Group line items into the closest listed category; never invent a category. Spread tax, fees and discounts across the entries in proportion so the entries add up to the receipt total. Use the merchant name printed on the receipt. Use the receipt date if it is printed, otherwise today. Receipts often print the card type and its last 4 digits (for example VISA ****1234); use that to pick the matching listed payment method and use its name exactly. If the receipt does not show which card, use an empty string. Put a few of the main items in each description. If the image is not a receipt or cannot be read, do not call the tool; reply with one short sentence saying so.',
-      tools: [ASSISTANT_TOOLS[0]],
+      max_tokens: 6000,
+      output_config: { effort: 'medium' },
+      system: 'You transcribe receipt photos for a personal expense tracker. Call read_receipt with every purchased line item exactly as printed: its name and the final price on that line (after any per-item discount, negative for returns or coupons). Copy numbers carefully; do not calculate or estimate. Give each item the closest listed category; never invent a category. Also copy the printed tax and the printed grand total. If the image is not a receipt or cannot be read, do not call the tool; reply with one short sentence saying so.',
+      tools: [RECEIPT_TOOL],
       messages: [{
         role: 'user',
         content: [
@@ -547,21 +578,50 @@ app.post('/api/scan', authenticateUser, async (req, res) => {
     });
 
     if (response.stop_reason === 'refusal') return res.json({ kind: 'answer', speech: 'Sorry, I couldn\'t read that photo.' });
-    const proposal = response.content.find(b => b.type === 'tool_use' && b.name === 'propose_expenses');
-    if (!proposal) {
+    const call = response.content.find(b => b.type === 'tool_use' && b.name === 'read_receipt');
+    if (!call) {
       const text = response.content.filter(b => b.type === 'text').map(b => b.text).join(' ').trim();
       return res.json({ kind: 'answer', speech: text || 'Sorry, I couldn\'t read that receipt. Try a clearer, closer photo.' });
     }
-    const entries = (proposal.input.entries || [])
-      .map(e => ({
-        ...e,
-        amount: Math.round(Number(e.amount) * 100) / 100,
-        category: categoryNames.find(n => n.toLowerCase() === String(e.category).toLowerCase()) || e.category,
-        paymentMethod: matchPayment(e.paymentMethod, paymentMethods)
-      }))
-      .filter(e => e.amount && /^\d{4}-\d{2}-\d{2}$/.test(e.date));
-    if (!entries.length) return res.json({ kind: 'answer', speech: 'Sorry, I couldn\'t find any amounts on that receipt.' });
-    res.json({ kind: 'proposal', entries, speech: proposal.input.spoken_confirmation });
+    const r = call.input;
+    const cents = (n) => Math.round(Number(n || 0) * 100);
+    const items = (r.items || [])
+      .map(it => ({ name: String(it.name || '').trim(), cents: cents(it.amount), category: categoryNames.find(n => n.toLowerCase() === String(it.category).toLowerCase()) || '' }))
+      .filter(it => it.cents !== 0 && it.category);
+    if (!items.length) return res.json({ kind: 'answer', speech: 'Sorry, I couldn\'t find any items on that receipt.' });
+
+    // Group by category in cents, then spread tax/fees so the entries add up to the printed total.
+    const groups = {};
+    items.forEach(it => {
+      groups[it.category] = groups[it.category] || { cents: 0, names: [] };
+      groups[it.category].cents += it.cents;
+      groups[it.category].names.push(it.name);
+    });
+    const itemsCents = items.reduce((sum, it) => sum + it.cents, 0);
+    const totalCents = cents(r.total);
+    const extraCents = totalCents ? totalCents - itemsCents : cents(r.tax);
+    const cats = Object.keys(groups);
+    let allocated = 0;
+    cats.forEach((c, i) => {
+      const share = i === cats.length - 1 ? extraCents - allocated : Math.round(extraCents * (groups[c].cents / (itemsCents || 1)));
+      allocated += share;
+      groups[c].cents += share;
+    });
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(r.date || '')) ? r.date : today;
+    const paymentMethod = matchPayment(r.payment, paymentMethods);
+    const entries = cats.map(c => ({
+      date,
+      amount: groups[c].cents / 100,
+      category: c,
+      merchant: String(r.merchant || '').trim(),
+      paymentMethod,
+      description: groups[c].names.slice(0, 4).join(', ') + (groups[c].names.length > 4 ? ` +${groups[c].names.length - 4} more` : '')
+    }));
+    const finalCents = entries.reduce((sum, e) => sum + cents(e.amount), 0);
+    const note = totalCents && finalCents === totalCents
+      ? `Split into ${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}, adding up to the receipt total of $${(totalCents / 100).toFixed(2)}.`
+      : `I couldn't read the receipt total, so please check the amounts.`;
+    res.json({ kind: 'proposal', entries, speech: note });
   } catch (error) {
     console.error('Scan error:', error);
     const status = error instanceof Anthropic.AuthenticationError ? 503 : 500;
