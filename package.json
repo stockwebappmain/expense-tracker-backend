@@ -19,7 +19,8 @@
     "axios": "^1.4.0",
     "body-parser": "^1.20.2",
     "jsonwebtoken": "^9.0.2",
-    "cookie-parser": "^1.4.6"
+    "cookie-parser": "^1.4.6",
+    "@anthropic-ai/sdk": "^0.133.0"
   },
   "devDependencies": {
     "nodemon": "^2.0.20"
