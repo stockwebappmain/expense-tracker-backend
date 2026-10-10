@@ -176,7 +176,7 @@ app.get('/api/expenses', authenticateUser, async (req, res) => {
       refresh_token: req.user.refreshToken
     });
 
-    const data = await getSheetData(auth, 'Expenses!A2:J');
+    const data = await getSheetData(auth, 'Expenses!A2:K');
 
     const expenses = data.filter(row => row[0]).map(row => ({
       date: row[0],
@@ -189,7 +189,8 @@ app.get('/api/expenses', authenticateUser, async (req, res) => {
       description: row[6],
       type: row[7],
       entryMethod: row[8] || '',
-      enteredBy: row[9] || ''
+      enteredBy: row[9] || '',
+      transactionId: row[10] || ''
     }));
 
     res.json(expenses);
@@ -201,7 +202,7 @@ app.get('/api/expenses', authenticateUser, async (req, res) => {
 // Add new expense
 app.post('/api/expenses', authenticateUser, async (req, res) => {
   try {
-    const { date, amount, category, merchant, paymentMethod, description, entryMethod, createdAt } = req.body;
+    const { date, amount, category, merchant, paymentMethod, description, entryMethod, createdAt, transactionId } = req.body;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) return res.status(400).json({ error: 'Date must be YYYY-MM-DD' });
     const amountNum = toNum(amount);
     if (!amountNum) return res.status(400).json({ error: 'Amount cannot be 0' });
@@ -225,11 +226,15 @@ app.post('/api/expenses', authenticateUser, async (req, res) => {
     if (!match) return res.status(400).json({ error: `Unknown category: ${category}` });
     const type = match[4] || '';
 
-    await appendToSheet(auth, 'Expenses!A:J', [
-      date, stamp, amountNum, match[0], String(paymentMethod).trim(), merchant || '', description || '', type, method, req.user.email || ''
+    const txId = /^T-[A-Za-z0-9-]{4,40}$/.test(String(transactionId || ''))
+      ? transactionId
+      : `T-${stamp.replace(/\D/g, '').slice(0, 12)}-${Math.random().toString(36).slice(2, 6)}`;
+
+    await appendToSheet(auth, 'Expenses!A:K', [
+      date, stamp, amountNum, match[0], String(paymentMethod).trim(), merchant || '', description || '', type, method, req.user.email || '', txId
     ]);
 
-    res.json({ success: true, type, entryMethod: method });
+    res.json({ success: true, type, entryMethod: method, transactionId: txId });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
