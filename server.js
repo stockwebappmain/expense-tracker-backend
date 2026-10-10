@@ -409,19 +409,23 @@ const RECEIPT_TOOL = {
   input_schema: {
     type: 'object',
     additionalProperties: false,
-    required: ['merchant', 'date', 'payment', 'items', 'subtotal', 'tax', 'total'],
+    required: ['merchant', 'date', 'card_text', 'card_last4', 'items', 'subtotal', 'tax', 'total'],
     properties: {
       merchant: { type: 'string', description: 'Store name as printed.' },
       date: { type: 'string', description: 'Receipt date as YYYY-MM-DD, or empty string if not printed.' },
-      payment: { type: 'string', description: 'Matching listed payment method name if the receipt shows the card (type or last 4 digits), otherwise the card text as printed, otherwise empty string.' },
+      card_text: { type: 'string', description: 'The card or tender line exactly as printed (for example "CAPITAL ONE- 1317" or "VISA ****1234"), or empty string.' },
+      card_last4: { type: 'string', description: 'The last 4 digits of the card used to pay, as printed on the payment/approval line, or empty string. Do not guess.' },
       items: {
         type: 'array',
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['name', 'amount', 'category'],
+          required: ['name', 'amount', 'category', 'taxable', 'split_category', 'split_percent'],
           properties: {
             name: { type: 'string' },
+            taxable: { type: 'boolean', description: 'True if the receipt marks this line as taxed (for example a T flag next to the price). False for lines marked as untaxed (N, 0, F or blank) when the receipt uses such flags.' },
+            split_category: { type: 'string', description: 'If a handwritten or printed note says to put part of this item on another category (for example "put 50% on Tree\'s expense" with a bracket covering it), that category name; otherwise empty string.' },
+            split_percent: { type: 'number', description: 'Percent of this item that goes to split_category (for example 50), or 0.' },
             amount: { type: 'number', description: 'The line total for this item, counted once (if a quantity and unit price are printed, use the line total, not both).' },
             category: { type: 'string', description: 'Exactly one listed category name.' }
           }
@@ -578,7 +582,7 @@ app.post('/api/scan', authenticateUser, async (req, res) => {
       model: ASSISTANT_MODEL,
       max_tokens: 6000,
       output_config: { effort: 'medium' },
-      system: 'You transcribe receipt photos for a personal expense tracker. Call read_receipt with every purchased item exactly once: its name and its line total (after any per-item discount, negative for returns or coupons). Items are only the things bought; never put subtotal, tax, total, balance, amount paid, card payment, cash, change or savings summary lines in items, they go in their own fields or are left out. If a quantity and unit price are printed, use only the line total. Copy numbers carefully; do not calculate or estimate. Give each item the closest listed category; never invent a category. Also copy the printed tax and the printed grand total. If the image is not a receipt or cannot be read, do not call the tool; reply with one short sentence saying so.',
+      system: 'You transcribe receipt photos for a personal expense tracker. Call read_receipt with every purchased item exactly once: its name and its line total (after any per-item discount, negative for returns or coupons). Items are only the things bought; never put subtotal, tax, total, balance, amount paid, card payment, cash, change or savings summary lines in items, they go in their own fields or are left out. If a quantity and unit price are printed, use only the line total. An instant-savings or coupon line right under an item is its own item with a negative amount. Copy numbers carefully; do not calculate or estimate. Read the tax flag printed beside each price to set taxable. If someone has written instructions on the receipt (for example "put 50% on Tree\'s expense" with a bracket or arrow marking some items), apply them to exactly the marked items using split_category and split_percent, matching the closest listed category (for example "Tree - Personal Expenses"). Give each item the closest listed category; never invent a category. Also copy the printed tax and the printed grand total. If the image is not a receipt or cannot be read, do not call the tool; reply with one short sentence saying so.',
       tools: [RECEIPT_TOOL],
       messages: [{
         role: 'user',
@@ -597,48 +601,68 @@ app.post('/api/scan', authenticateUser, async (req, res) => {
     }
     const r = call.input;
     const cents = (n) => Math.round(Number(n || 0) * 100);
-    const items = (r.items || [])
-      .map(it => ({ name: String(it.name || '').trim(), cents: cents(it.amount), category: closestCategory(it.category, categoryNames) }))
+    let items = (r.items || [])
+      .map(it => ({
+        name: String(it.name || '').trim(),
+        cents: cents(it.amount),
+        category: closestCategory(it.category, categoryNames),
+        taxable: !!it.taxable,
+        splitCategory: it.split_category && Number(it.split_percent) > 0 ? closestCategory(it.split_category, categoryNames) : '',
+        splitPercent: Math.min(100, Math.max(0, Number(it.split_percent) || 0))
+      }))
       .filter(it => it.cents !== 0)
-      .filter(it => !/^(sub ?total|total|grand total|tax|sales tax|balance|amount due|amount paid|change|cash|visa|mastercard|amex|debit|credit|payment|you saved|savings)\b/i.test(it.name));
+      .filter(it => !/^(sub ?total|total|grand total|tax|sales tax|balance|amount due|amount paid|change|cash|visa|mastercard|amex|debit|credit|payment|you saved)\b/i.test(it.name));
     if (!items.length) return res.json({ kind: 'answer', speech: 'Sorry, I couldn\'t find any items on that receipt.' });
 
-    // Group by category in cents, then spread tax/fees so the entries add up to the printed total.
-    const groups = {};
-    items.forEach(it => {
-      groups[it.category] = groups[it.category] || { cents: 0, names: [] };
-      groups[it.category].cents += it.cents;
-      groups[it.category].names.push(it.name);
-    });
-    let itemsCents = items.reduce((sum, it) => sum + it.cents, 0);
     const totalCents = cents(r.total);
     const subtotalCents = cents(r.subtotal);
-    // If the items add up to about twice the receipt, the summary lines or a repeated list were read as items.
+    const sumOf = (list) => list.reduce((sum, it) => sum + it.cents, 0);
+    // If the items add up to about twice the receipt, a repeated list was read; keep one copy.
     const reference = subtotalCents || totalCents;
-    if (reference && itemsCents > reference * 1.6) {
+    if (reference && sumOf(items) > reference * 1.6) {
       const half = items.slice(0, Math.ceil(items.length / 2));
-      const halfCents = half.reduce((sum, it) => sum + it.cents, 0);
-      if (Math.abs(halfCents - reference) <= Math.abs(itemsCents - reference)) {
-        items.splice(half.length);
-        Object.keys(groups).forEach(k => delete groups[k]);
-        items.forEach(it => {
-          groups[it.category] = groups[it.category] || { cents: 0, names: [] };
-          groups[it.category].cents += it.cents;
-          groups[it.category].names.push(it.name);
-        });
-        itemsCents = halfCents;
-      }
+      if (Math.abs(sumOf(half) - reference) <= Math.abs(sumOf(items) - reference)) items = half;
     }
-    const extraCents = totalCents ? totalCents - itemsCents : cents(r.tax);
-    const cats = Object.keys(groups);
-    let allocated = 0;
-    cats.forEach((c, i) => {
-      const share = i === cats.length - 1 ? extraCents - allocated : Math.round(extraCents * (groups[c].cents / (itemsCents || 1)));
-      allocated += share;
-      groups[c].cents += share;
+
+    // Apply handwritten splits ("put 50% on Tree's expense") line by line.
+    const lines = [];
+    items.forEach(it => {
+      if (it.splitCategory && it.splitCategory !== it.category) {
+        const moved = Math.round(it.cents * it.splitPercent / 100);
+        if (moved) lines.push({ ...it, cents: moved, category: it.splitCategory, name: `${it.name} (${it.splitPercent}%)` });
+        if (it.cents - moved) lines.push({ ...it, cents: it.cents - moved });
+      } else {
+        lines.push(it);
+      }
     });
+
+    // Tax goes only on lines marked taxable; if none are marked, spread it over everything.
+    const itemsCents = sumOf(lines);
+    const taxCents = cents(r.tax) || (totalCents && subtotalCents ? totalCents - subtotalCents : 0);
+    const taxed = lines.some(l => l.taxable) ? lines.filter(l => l.taxable) : lines;
+    const taxBase = sumOf(taxed) || 1;
+    let taxLeft = taxCents;
+    taxed.forEach((l, i) => {
+      const share = i === taxed.length - 1 ? taxLeft : Math.round(taxCents * (l.cents / taxBase));
+      l.cents += share;
+      taxLeft -= share;
+    });
+    // Any leftover difference from the printed total (fees, rounding) goes to the largest line.
+    const diff = totalCents ? totalCents - (itemsCents + taxCents) : 0;
+    if (diff && Math.abs(diff) <= Math.max(100, Math.round(totalCents * 0.05))) {
+      lines.reduce((a, b) => (Math.abs(b.cents) > Math.abs(a.cents) ? b : a)).cents += diff;
+    }
+
+    const groups = {};
+    lines.forEach(l => {
+      groups[l.category] = groups[l.category] || { cents: 0, names: [] };
+      groups[l.category].cents += l.cents;
+      groups[l.category].names.push(l.name);
+    });
+    const cats = Object.keys(groups);
     const date = /^\d{4}-\d{2}-\d{2}$/.test(String(r.date || '')) ? r.date : today;
-    const paymentMethod = matchPayment(r.payment, paymentMethods);
+    const last4 = String(r.card_last4 || '').replace(/\D/g, '').slice(-4);
+    const paymentMethod = (last4.length === 4 && matchPayment(last4, paymentMethods)) || matchPayment(r.card_text, paymentMethods);
     const entries = cats.map(c => ({
       date,
       amount: groups[c].cents / 100,
