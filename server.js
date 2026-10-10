@@ -20,8 +20,11 @@ if (process.env.NODE_ENV !== 'production') {
 const app = express();
 
 // Middleware
+const FRONTEND_URLS = (process.env.FRONTEND_URL || 'http://localhost:3000').split(',').map(u => u.trim().replace(/\/$/, '')).filter(Boolean);
+const pickFrontend = (candidate) => (FRONTEND_URLS.includes(candidate) ? candidate : FRONTEND_URLS[0]);
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: FRONTEND_URLS,
   credentials: true
 }));
 app.use(express.json());
@@ -59,11 +62,12 @@ const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const sheetsClient = google.sheets('v4');
 
 // Authentication Routes
-app.get('/auth/google', passport.authenticate('google', {
+app.get('/auth/google', (req, res, next) => passport.authenticate('google', {
   scope: ['profile', 'email', 'https://www.googleapis.com/auth/spreadsheets'],
   accessType: 'offline',
-  prompt: 'consent'
-}));
+  prompt: 'consent',
+  state: pickFrontend(req.query.from)
+})(req, res, next));
 
 app.get('/auth/google/callback',
   passport.authenticate('google', { failureRedirect: '/login' }),
@@ -82,8 +86,7 @@ app.get('/auth/google/callback',
     );
 
     // Redirect with token in URL for localStorage storage
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    res.redirect(`${frontendUrl}?auth_token=${token}`);
+    res.redirect(`${pickFrontend(req.query.state)}?auth_token=${token}`);
   }
 );
 
@@ -108,7 +111,7 @@ app.get('/api/auth/user', (req, res) => {
 
 app.get('/logout', (req, res) => {
   res.clearCookie('auth_token');
-  res.redirect(process.env.FRONTEND_URL || 'http://localhost:3000');
+  res.redirect(FRONTEND_URLS[0]);
 });
 
 // Middleware to check authentication
