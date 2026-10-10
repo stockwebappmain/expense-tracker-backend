@@ -124,6 +124,11 @@ const authenticateUser = (req, res, next) => {
   }
 };
 
+const toNum = (v) => {
+  const n = parseFloat(String(v ?? '').replace(/[^0-9.\-]/g, ''));
+  return isNaN(n) ? 0 : n;
+};
+
 // Google Sheets API Helper
 async function getSheetData(auth, range) {
   try {
@@ -172,7 +177,7 @@ app.get('/api/expenses', authenticateUser, async (req, res) => {
     const expenses = data.map(row => ({
       date: row[0],
       time: row[1],
-      amount: parseFloat(row[2]),
+      amount: toNum(row[2]),
       category: row[3],
       paymentMethod: row[4],
       merchant: row[5],
@@ -253,13 +258,14 @@ app.get('/api/categories', authenticateUser, async (req, res) => {
       refresh_token: req.user.refreshToken
     });
 
-    const data = await getSheetData(auth, 'Categories!A2:D');
+    const data = await getSheetData(auth, 'Categories!A2:E');
 
     const categories = data.map(row => ({
       name: row[0],
       icon: row[1],
       color: row[2],
-      budget: parseFloat(row[3])
+      budget: toNum(row[3]),
+      type: row[4]
     }));
 
     res.json(categories);
@@ -289,13 +295,35 @@ app.get('/api/budget', authenticateUser, async (req, res) => {
       res.json({
         month: budget[0],
         year: budget[1],
-        totalBudget: parseFloat(budget[2]),
-        fixedBudget: parseFloat(budget[3]),
-        variableBudget: parseFloat(budget[4])
+        totalBudget: toNum(budget[2]),
+        fixedBudget: toNum(budget[3]),
+        variableBudget: toNum(budget[4])
       });
     } else {
       res.json(null);
     }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get every month's budget row
+app.get('/api/budgets', authenticateUser, async (req, res) => {
+  try {
+    const auth = google.auth.fromJSON({
+      type: 'authorized_user',
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: req.user.refreshToken
+    });
+    const data = await getSheetData(auth, 'Budget!A2:F');
+    res.json(data.filter(row => row[0]).map(row => ({
+      month: row[0],
+      year: String(row[1]),
+      totalBudget: toNum(row[2]),
+      fixedBudget: toNum(row[3]),
+      variableBudget: toNum(row[4])
+    })));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
