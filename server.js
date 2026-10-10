@@ -283,7 +283,7 @@ app.get('/api/budget', authenticateUser, async (req, res) => {
     const month = today.toLocaleString('en-US', { month: 'long' });
     const year = today.getFullYear();
 
-    const budget = data.find(row => row[0] === month && row[1] === year);
+    const budget = data.find(row => row[0] === month && String(row[1]) === String(year));
 
     if (budget) {
       res.json({
