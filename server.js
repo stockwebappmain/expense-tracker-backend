@@ -206,6 +206,7 @@ app.post('/api/expenses', authenticateUser, async (req, res) => {
     const amountNum = toNum(amount);
     if (!amountNum) return res.status(400).json({ error: 'Amount cannot be 0' });
     if (!category) return res.status(400).json({ error: 'Category is required' });
+    if (!String(paymentMethod || '').trim()) return res.status(400).json({ error: 'Payment method is required' });
     const ENTRY_METHODS = ['Manual', 'Voice', 'Text', 'Email', 'Scan'];
     const method = ENTRY_METHODS.includes(entryMethod) ? entryMethod : 'Manual';
     const stamp = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(String(createdAt || ''))
@@ -225,7 +226,7 @@ app.post('/api/expenses', authenticateUser, async (req, res) => {
     const type = match[4] || '';
 
     await appendToSheet(auth, 'Expenses!A:J', [
-      date, stamp, amountNum, match[0], paymentMethod || '', merchant || '', description || '', type, method, req.user.email || ''
+      date, stamp, amountNum, match[0], String(paymentMethod).trim(), merchant || '', description || '', type, method, req.user.email || ''
     ]);
 
     res.json({ success: true, type, entryMethod: method });
@@ -292,6 +293,37 @@ app.get('/api/budget', authenticateUser, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Payment methods: column A type, B nickname, C last 4 digits, D account type
+async function loadPaymentMethods(auth) {
+  const rows = await getSheetData(auth, 'PaymentMethods!A2:D').catch(() => []);
+  return rows
+    .map(r => {
+      const method = String(r[0] || '').trim();
+      const nickname = String(r[1] || '').trim();
+      const last4 = String(r[2] || '').replace(/\D/g, '').slice(-4);
+      return { method, nickname, last4, accountType: String(r[3] || '').trim(), label: nickname || method };
+    })
+    .filter(p => p.label);
+}
+
+const describePayment = (p) => `${p.label} (${[p.method !== p.label ? p.method : '', p.last4 ? `ends in ${p.last4}` : ''].filter(Boolean).join(', ') || 'no details'})`;
+
+function matchPayment(value, methods) {
+  const v = String(value || '').trim().toLowerCase();
+  if (!v) return '';
+  const exact = methods.find(p => p.label.toLowerCase() === v || p.nickname.toLowerCase() === v);
+  if (exact) return exact.label;
+  const digits = v.replace(/\D/g, '').slice(-4);
+  if (digits.length === 4) {
+    const byLast4 = methods.find(p => p.last4 === digits);
+    if (byLast4) return byLast4.label;
+  }
+  const byNamePart = methods.find(p => p.nickname && (v.includes(p.nickname.toLowerCase()) || p.nickname.toLowerCase().includes(v)));
+  if (byNamePart) return byNamePart.label;
+  const byType = methods.filter(p => p.method.toLowerCase() === v);
+  return byType.length === 1 ? byType[0].label : '';
+}
 
 // ---------- Expense assistant (voice / text) ----------
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY });
@@ -395,18 +427,18 @@ app.post('/api/assistant', authenticateUser, async (req, res) => {
       client_secret: process.env.GOOGLE_CLIENT_SECRET,
       refresh_token: req.user.refreshToken
     });
-    const [categoryRows, paymentRows, expenseRows] = await Promise.all([
+    const [categoryRows, paymentMethods, expenseRows] = await Promise.all([
       getSheetData(auth, 'Categories!A2:E'),
-      getSheetData(auth, 'PaymentMethods!A2:A').catch(() => []),
+      loadPaymentMethods(auth),
       getSheetData(auth, 'Expenses!A2:J')
     ]);
     const categoryNames = categoryRows.map(r => String(r[0] || '').trim()).filter(Boolean);
-    const paymentNames = paymentRows.map(r => String(r[0] || '').trim()).filter(Boolean);
     const merchants = [...new Set(expenseRows.map(r => String(r[5] || '').trim()).filter(Boolean))].slice(-80);
 
     const system = [
       'You are the assistant inside a personal expense tracker app. You only help with recording expenses and refunds and answering questions about the user\'s recorded expenses. For anything else, reply with one short sentence saying you can only help with expenses.',
-      'When the user describes spending or a refund, call propose_expenses. One receipt or sentence can contain several entries in different categories; propose each separately. Pick the closest listed category; never invent a category. Use a listed payment method only if the user said one, otherwise use an empty string.',
+      'When the user describes spending or a refund, call propose_expenses. One receipt or sentence can contain several entries in different categories; propose each separately. Pick the closest listed category; never invent a category.',
+      'A payment method is required for every entry. Match what the user says to one listed payment method by its name, its card type or its last 4 digits, and use that name exactly. If the user did not say how they paid, or it matches more than one, do not call any tool; ask one short question naming the options.',
       'If the amount is missing, do not call any tool; ask one short question for it.',
       'When the user asks about their spending, call query_expenses with an explicit date range, then answer in one or two short spoken sentences with dollar amounts. Your replies are read aloud: no markdown, no lists, no emoji.',
       'Earlier turns of this conversation may be included as context. If the user is correcting a previous proposal, propose the corrected entries again in full.'
@@ -416,7 +448,7 @@ app.post('/api/assistant', authenticateUser, async (req, res) => {
     const userText = [
       `Today is ${today}.`,
       `Categories: ${categoryNames.join(', ')}.`,
-      `Payment methods: ${paymentNames.join(', ') || 'not set'}.`,
+      `Payment methods (use the name before the brackets): ${paymentMethods.map(describePayment).join('; ') || 'not set'}.`,
       `Known merchants: ${merchants.join(', ') || 'none yet'}.`,
       contextText ? `Conversation so far:\n${contextText}` : '',
       `User said: "${transcript}"`
@@ -444,10 +476,13 @@ app.post('/api/assistant', authenticateUser, async (req, res) => {
           .map(e => ({
             ...e,
             category: categoryNames.find(n => n.toLowerCase() === String(e.category).toLowerCase()) || e.category,
-            paymentMethod: paymentNames.find(n => n.toLowerCase() === String(e.paymentMethod).toLowerCase()) || ''
+            paymentMethod: matchPayment(e.paymentMethod, paymentMethods)
           }))
           .filter(e => e.amount && /^\d{4}-\d{2}-\d{2}$/.test(e.date));
         if (!entries.length) return res.json({ kind: 'clarify', speech: 'Sorry, I didn\'t catch the amount. How much was it?' });
+        if (entries.some(e => !e.paymentMethod)) {
+          return res.json({ kind: 'clarify', speech: `Which card or account did you use? ${paymentMethods.map(p => p.label).join(', ')}.` });
+        }
         return res.json({ kind: 'proposal', entries, speech: proposal.input.spoken_confirmation });
       }
 
@@ -490,24 +525,23 @@ app.post('/api/scan', authenticateUser, async (req, res) => {
       client_secret: process.env.GOOGLE_CLIENT_SECRET,
       refresh_token: req.user.refreshToken
     });
-    const [categoryRows, paymentRows] = await Promise.all([
+    const [categoryRows, paymentMethods] = await Promise.all([
       getSheetData(auth, 'Categories!A2:E'),
-      getSheetData(auth, 'PaymentMethods!A2:A').catch(() => [])
+      loadPaymentMethods(auth)
     ]);
     const categoryNames = categoryRows.map(r => String(r[0] || '').trim()).filter(Boolean);
-    const paymentNames = paymentRows.map(r => String(r[0] || '').trim()).filter(Boolean);
 
     const response = await anthropic.messages.create({
       model: ASSISTANT_MODEL,
       max_tokens: 4000,
       output_config: { effort: 'low' },
-      system: 'You read receipt photos for a personal expense tracker. Call propose_expenses with the receipt split into one entry per category that appears on it. Group line items into the closest listed category; never invent a category. Spread tax, fees and discounts across the entries in proportion so the entries add up to the receipt total. Use the merchant name printed on the receipt. Use the receipt date if it is printed, otherwise today. Use a listed payment method only if the receipt clearly shows it (for example a card type), otherwise an empty string. Put a few of the main items in each description. If the image is not a receipt or cannot be read, do not call the tool; reply with one short sentence saying so.',
+      system: 'You read receipt photos for a personal expense tracker. Call propose_expenses with the receipt split into one entry per category that appears on it. Group line items into the closest listed category; never invent a category. Spread tax, fees and discounts across the entries in proportion so the entries add up to the receipt total. Use the merchant name printed on the receipt. Use the receipt date if it is printed, otherwise today. Receipts often print the card type and its last 4 digits (for example VISA ****1234); use that to pick the matching listed payment method and use its name exactly. If the receipt does not show which card, use an empty string. Put a few of the main items in each description. If the image is not a receipt or cannot be read, do not call the tool; reply with one short sentence saying so.',
       tools: [ASSISTANT_TOOLS[0]],
       messages: [{
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: mediaType, data: image } },
-          { type: 'text', text: `Today is ${today}.\nCategories: ${categoryNames.join(', ')}.\nPayment methods: ${paymentNames.join(', ') || 'not set'}.` }
+          { type: 'text', text: `Today is ${today}.\nCategories: ${categoryNames.join(', ')}.\nPayment methods (use the name before the brackets): ${paymentMethods.map(describePayment).join('; ') || 'not set'}.` }
         ]
       }]
     });
@@ -523,7 +557,7 @@ app.post('/api/scan', authenticateUser, async (req, res) => {
         ...e,
         amount: Math.round(Number(e.amount) * 100) / 100,
         category: categoryNames.find(n => n.toLowerCase() === String(e.category).toLowerCase()) || e.category,
-        paymentMethod: paymentNames.find(n => n.toLowerCase() === String(e.paymentMethod).toLowerCase()) || ''
+        paymentMethod: matchPayment(e.paymentMethod, paymentMethods)
       }))
       .filter(e => e.amount && /^\d{4}-\d{2}-\d{2}$/.test(e.date));
     if (!entries.length) return res.json({ kind: 'answer', speech: 'Sorry, I couldn\'t find any amounts on that receipt.' });
@@ -544,8 +578,7 @@ app.get('/api/payment-methods', authenticateUser, async (req, res) => {
       client_secret: process.env.GOOGLE_CLIENT_SECRET,
       refresh_token: req.user.refreshToken
     });
-    const data = await getSheetData(auth, 'PaymentMethods!A2:A');
-    res.json(data.map(row => String(row[0] || '').trim()).filter(Boolean));
+    res.json(await loadPaymentMethods(auth));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
