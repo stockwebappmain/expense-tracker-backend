@@ -490,7 +490,7 @@ app.post('/api/assistant', authenticateUser, async (req, res) => {
     const system = [
       'You are the assistant inside a personal expense tracker app. You only help with recording expenses and refunds and answering questions about the user\'s recorded expenses. For anything else, reply with one short sentence saying you can only help with expenses.',
       'When the user describes spending or a refund, call propose_expenses. One receipt or sentence can contain several entries in different categories; propose each separately. Pick the closest listed category; never invent a category.',
-      'A payment method is required for every entry. Match what the user says to one listed payment method by its name, its card type or its last 4 digits, and use that name exactly. If the user did not say how they paid, or it matches more than one, do not call any tool; ask one short question naming the options.',
+      'A payment method is required for every entry. Match what the user says to one listed payment method by its name, its card type or its last 4 digits, and use that name exactly. If the user did not say how they paid, or it matches more than one, do not call any tool; ask one short question such as "Which card did you use?" without listing the options.',
       'If the amount is missing, do not call any tool; ask one short question for it.',
       'When the user asks about their spending, call query_expenses with an explicit date range, then answer in one or two short spoken sentences with dollar amounts. Your replies are read aloud: no markdown, no lists, no emoji.',
       'Earlier turns of this conversation may be included as context. If the user is correcting a previous proposal, propose the corrected entries again in full.'
@@ -533,7 +533,7 @@ app.post('/api/assistant', authenticateUser, async (req, res) => {
           .filter(e => e.amount && /^\d{4}-\d{2}-\d{2}$/.test(e.date));
         if (!entries.length) return res.json({ kind: 'clarify', speech: 'Sorry, I didn\'t catch the amount. How much was it?' });
         if (entries.some(e => !e.paymentMethod)) {
-          return res.json({ kind: 'clarify', speech: `Which card or account did you use? ${paymentMethods.map(p => p.label).join(', ')}.` });
+          return res.json({ kind: 'clarify', speech: 'Which card did you use?' });
         }
         return res.json({ kind: 'proposal', entries, speech: proposal.input.spoken_confirmation });
       }
