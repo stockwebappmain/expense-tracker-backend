@@ -333,7 +333,7 @@ function matchPayment(value, methods) {
 // ---------- Expense assistant (voice / text) ----------
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY });
 const ASSISTANT_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-5-5';
-const NON_SPEND_TYPES = ['savings', 'transfer'];
+const NON_SPEND_TYPES = ['savings', 'transfer', 'payment'];
 
 const ASSISTANT_TOOLS = [
   {
